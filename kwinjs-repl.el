@@ -28,9 +28,7 @@
                 (lambda (proc string)
                   (comint-send-string proc (concat (json-serialize string) "\n"))))
 
-    (make-comint-in-buffer "kwinjs"
-                           (current-buffer)
-                           kwinjs--repl)
+    (kwinjs-init-process)
     (goto-char (point-max))))
 
 ;;;###autoload
@@ -49,6 +47,13 @@
       (comint-send-input)
     (newline)))
 
+(defun kwinjs-init-process ()
+  (interactive)
+  (make-comint-in-buffer "kwinjs"
+                         (current-buffer)
+                         kwinjs--repl))
+
 (keymap-set kwinjs-mode-map "RET" 'kwinjs-send)
+(keymap-set kwinjs-mode-map "C-c RET" 'kwinjs-init-process)
 
 (provide 'kwinjs)
