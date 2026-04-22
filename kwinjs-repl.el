@@ -55,3 +55,5 @@
       (newline))))
 
 (keymap-set kwinjs-mode-map "RET" 'kwinjs-send)
+
+(provide 'kwinjs)
