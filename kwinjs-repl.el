@@ -45,14 +45,9 @@
 
 (defun kwinjs-send ()
   (interactive)
-  (cond
-   ((eq (log-expr (char-before (point))) ?\;)
-    (logfmt "kwinjs before send: %S"
-          (buffer-substring-no-properties (process-mark (get-buffer-process (current-buffer)))
-                                          (point)))
-    (comint-send-input))
-   (t (logfmt "kwinjs newline")
-      (newline))))
+  (if (eq (char-before (point)) ?\;)
+      (comint-send-input)
+    (newline)))
 
 (keymap-set kwinjs-mode-map "RET" 'kwinjs-send)
 
