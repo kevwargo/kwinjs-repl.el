@@ -39,7 +39,7 @@
     (unless buf
       (with-current-buffer (setq buf (get-buffer-create bufname))
         (kwinjs-mode)))
-    (pop-to-buffer-same-window buf)))
+    (pop-to-buffer buf)))
 
 (defun kwinjs-send ()
   (interactive)
