@@ -18,6 +18,7 @@ from tempfile import NamedTemporaryFile
 from dbus_next import BusType
 from dbus_next.aio import MessageBus
 from dbus_next.aio.proxy_object import ProxyInterface
+from dbus_next.errors import DBusError
 from dbus_next.service import ServiceInterface, method
 
 logger = logging.getLogger("kwinctl")
@@ -42,6 +43,7 @@ class KWinJSRepl(ServiceInterface):
         self._callback_event = asyncio.Event()
         self._stdout_queue = asyncio.Queue()
         self._stdout_task: asyncio.Task | None = None
+        self._detected_kwin_script_path: str | None = None
 
     @cached_property
     def loop(self):
@@ -85,7 +87,7 @@ class KWinJSRepl(ServiceInterface):
                 await self._callback_event.wait()
             except Exception as e:
                 e = f"{type(e).__name__}({e})"
-                logging.error(f"Exception when running script: {e}")
+                logging.exception(f"Exception when running script: {e}")
                 self.write_stdout(e)
             finally:
                 self._callback_event.clear()
@@ -119,9 +121,10 @@ class KWinJSRepl(ServiceInterface):
             if script_id < 0:
                 raise RuntimeError(f"loadScript returned {script_id}")
 
-            self._script = await self.get_iface(
-                "org.kde.KWin", f"/Scripting/Script{script_id}", "org.kde.kwin.Script"
-            )
+            self._script = await self.get_script_iface(script_id)
+            if not self._script:
+                return
+
             try:
                 await self._script.call_run()
             finally:
@@ -134,6 +137,32 @@ class KWinJSRepl(ServiceInterface):
         introspection = await self.bus.introspect(service, path)
         obj = self.bus.get_proxy_object(service, path, introspection)
         return obj.get_interface(interface)
+
+    async def get_script_iface(self, script_id: str):
+        svc, iface = "org.kde.KWin", "org.kde.kwin.Script"
+        if self._detected_kwin_script_path:
+            return await self.get_iface(
+                svc, self._detected_kwin_script_path.format(script_id=script_id), iface
+            )
+
+        exceptions = []
+        for path in (
+            "/Scripting/Script{script_id}",  # Plasma 6 style
+            "/{script_id}",  # Plasma 5 style
+        ):
+            try:
+                script = await self.get_iface(
+                    "org.kde.KWin", path.format(script_id=script_id), "org.kde.kwin.Script"
+                )
+            except DBusError as e:
+                exceptions.append(e)
+            else:
+                self._detected_kwin_script_path = path
+
+                return script
+
+        for e in exceptions:
+            self.write_stdout(f"{type(e).__name__}({e})")
 
     async def shutdown(self, sig=None):
         if self._shutting_down:
