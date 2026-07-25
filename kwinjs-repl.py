@@ -11,20 +11,20 @@ import json
 import logging
 import signal
 import sys
-from functools import cached_property
+from contextlib import asynccontextmanager
+from functools import cached_property, partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from dbus_next import BusType
 from dbus_next.aio import MessageBus
-from dbus_next.aio.proxy_object import ProxyInterface
 from dbus_next.errors import DBusError
 from dbus_next.service import ServiceInterface, method
 
 logging.basicConfig(
     filename=Path("~/.cache/kwinjs-repl.log").expanduser(),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)7s | %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s %(process)d:%(thread)d %(levelname)7s | %(message)s",
 )
 
 SCRIPT_TEMPLATE = Path(__file__).parent / "script-template.js"
@@ -33,33 +33,27 @@ EVALUATOR = Path(__file__).parent / "evaluator.js"
 
 class KWinJSRepl(ServiceInterface):
     NAME = "org.kevwargo.kwinjsrepl"
+    PROMPT = "KWin JS #> "
 
     def __init__(self):
         super().__init__(self.NAME)
         self.bus: MessageBus | None = None
-        self._shutting_down = False
-        self._stdin_reader: asyncio.ReadTransport | None = None
-        self._script_iface: ProxyInterface | None = None
-        self._callback_event = asyncio.Event()
-        self._stdout_queue = asyncio.Queue()
-        self._stdout_task: asyncio.Task | None = None
-        self._detected_kwin_script_path: str | None = None
 
-        self._new = "--new" in sys.argv[1:]
-        self._expr_queue = asyncio.Queue()
+        self.stdout_queue = asyncio.Queue()
+        self.expr_queue = asyncio.Queue()
+
+        self._shutting_down = False
+        self._at_prompt = False
 
     @cached_property
     def loop(self):
         return asyncio.get_running_loop()
 
     async def run(self):
-        logging.info(f"Executed with {sys.argv[1:]}")
-
         self.register_signals()
         try:
             await self.register_dbus()
-            self._stdout_task = self.loop.create_task(self.stdout_loop())
-            await self.stdin_loop()
+            await asyncio.gather(self.stdin_loop(), self.stdout_loop())
         finally:
             await self.shutdown()
 
@@ -74,69 +68,30 @@ class KWinJSRepl(ServiceInterface):
         logging.info(f"D-Bus service {self.NAME} is running")
 
     async def stdin_loop(self):
-        reader = asyncio.StreamReader()
-        proto = asyncio.StreamReaderProtocol(reader)
-        self._stdin_reader, _ = await self.loop.connect_read_pipe(lambda: proto, sys.stdin)
-
-        logging.debug(f"Started main loop reading from {self._stdin_reader}")
-
-        if self._new:
-            await self._long_script(reader)
-        else:
-            await self._singleshot_loop(reader)
-
-    async def _long_script(self, reader: asyncio.StreamReader):
         script_body = f"const DBUS_NAME = {self.NAME!r};\n" + EVALUATOR.read_text()
-        await self._run_kwinjs_script(script_body)
-        if not self._script_iface:
-            return
+        async with self.script_running(script_body):
+            async for expr in read_stdin():
+                self._at_prompt = False
+                await self.expr_queue.put(expr)
+                logging.info(f"Read {expr!r} stdin -> queue")
 
-        async for expr in self._read_expressions(reader):
-            await self._expr_queue.put(expr)
-            logging.info(f"Queued {expr!r}")
+            logging.debug("stdin loop finished, stopping queues")
+            await self.stdout_queue.put(None)
+            await self.expr_queue.put(None)
 
-    async def _read_expressions(self, reader: asyncio.StreamReader):
-        while True:
-            logging.info("printing prompt")
-            self.write_stdout("KWin JS #> ", False)
-            line = await reader.readline()
-            try:
-                expr = json.loads(line)
-            except json.JSONDecodeError:
-                expr = line.decode().strip()
+    async def stdout_loop(self):
+        async with stdout_writer() as writer:
+            while True:
+                data = await self.stdout_queue.get()
+                if data is None:
+                    logging.debug("Received None in stdout loop, finishing")
+                    break
 
-            if not line or expr in ("exit;", "quit;"):
-                logging.info(f"received terminal message {line!r}, stopping")
-                break
+                writer.write(data.encode("utf-8", errors="replace"))
+                await writer.drain()
 
-            yield expr
-
-    async def _singleshot_loop(self, reader: asyncio.StreamReader):
-        async for expr in self._read_expressions(reader):
-            try:
-                await self._run_singleshot_script(expr)
-                await self._callback_event.wait()
-            except Exception as e:
-                e = f"{type(e).__name__}({e})"
-                logging.exception(f"Exception when running script: {e}")
-                self.write_stdout(e)
-            finally:
-                self._callback_event.clear()
-
-    async def _run_singleshot_script(self, body: str):
-        try:
-            await self._run_kwinjs_script(
-                SCRIPT_TEMPLATE.read_text()
-                .replace("<DBUS>", self.NAME)
-                .replace('("{<BODY>}");', body)
-            )
-        finally:
-            try:
-                await self._script_iface.call_stop()
-            finally:
-                self._script_iface = None
-
-    async def _run_kwinjs_script(self, body: str):
+    @asynccontextmanager
+    async def script_running(self, body: str):
         scripting = await self.get_iface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")
         with NamedTemporaryFile(mode="w+", prefix="kwinjs-repl-", suffix=".js") as f:
             f.write(body)
@@ -146,25 +101,22 @@ class KWinJSRepl(ServiceInterface):
             if script_id < 0:
                 raise RuntimeError(f"loadScript returned {script_id}")
 
-            self._script_iface = await self.get_script_iface(script_id)
-            logging.info(f"Loaded script {script_id} as {self._script_iface}")
-            if self._script_iface:
-                await self._script_iface.call_run()
+            iface = await self.get_script_iface(script_id)
+            logging.info(f"Loaded script {script_id} as {iface}")
+            await iface.call_run()
+            logging.info(f"Executed script {script_id}")
 
-    async def stdout_loop(self):
-        writer, proto = await self.loop.connect_write_pipe(
-            asyncio.streams.FlowControlMixin, sys.stdout
-        )
-        while True:
-            data = await self._stdout_queue.get()
-            if data is None:
-                break
-
-            writer.write(data.encode("utf-8", errors="replace"))
-            await proto._drain_helper()
+        try:
+            yield
+        finally:
+            await iface.call_stop()
 
     def write_stdout(self, data: str, newline=True):
-        self._stdout_queue.put_nowait(data + "\n" if newline else data)
+        self.stdout_queue.put_nowait(data + "\n" if newline else data)
+
+    def write_prompt(self):
+        self.write_stdout(self.PROMPT, False)
+        self._at_prompt = True
 
     async def get_iface(self, service: str, path: str, interface: str):
         introspection = await self.bus.introspect(service, path)
@@ -172,30 +124,18 @@ class KWinJSRepl(ServiceInterface):
         return obj.get_interface(interface)
 
     async def get_script_iface(self, script_id: int):
-        svc, iface = "org.kde.KWin", "org.kde.kwin.Script"
-        if self._detected_kwin_script_path:
-            return await self.get_iface(
-                svc, self._detected_kwin_script_path.format(script_id=script_id), iface
-            )
-
-        last_exception = None
         for path in (
             "/Scripting/Script{script_id}",  # Plasma 6 style
             "/{script_id}",  # Plasma 5 style
         ):
             try:
-                script = await self.get_iface(
+                return await self.get_iface(
                     "org.kde.KWin", path.format(script_id=script_id), "org.kde.kwin.Script"
                 )
-            except DBusError as e:
-                last_exception = e
-            else:
-                self._detected_kwin_script_path = path
-                logging.info(f"Found script {script_id} iface {script} at {path}")
+            except DBusError:
+                pass
 
-                return script
-
-        raise last_exception
+        raise RuntimeError(f"DBus interface for script {script_id} not found")
 
     async def shutdown(self, sig=None):
         if self._shutting_down:
@@ -206,23 +146,6 @@ class KWinJSRepl(ServiceInterface):
             logging.info(f"Caught sig={sig}, shutting down")
         else:
             logging.info("Shutting down")
-
-        if self._stdin_reader:
-            self._stdin_reader.close()
-
-        if self._script_iface:
-            try:
-                await self._script_iface.call_stop()
-            except Exception as e:
-                logging.warning(f"{type(e).__name__}({e}) when stopping leftover script")
-
-        self._stdout_queue.put_nowait(None)
-        if self._stdout_task:
-            self._stdout_task.cancel()
-            try:
-                await self._stdout_task
-            except asyncio.CancelledError:
-                pass
 
         if self.bus:
             try:
@@ -236,35 +159,83 @@ class KWinJSRepl(ServiceInterface):
                 logging.warning(f"{type(e).__name__}({e}) when disconnecting from D-Bus")
 
     @method()
-    def Log(self, value: "s"):  # noqa:F821
-        self.write_stdout(value)
+    def Prompt(self):
+        self.write_prompt()
 
     @method()
-    def LogJSON(self, value: "s"):  # noqa:F821
+    async def WatchExpr(self) -> "s":  # noqa:F821
+        # logging.debug("Received WatchExpr call")
+
+        try:
+            expr = await asyncio.wait_for(self.expr_queue.get(), 15)
+            if expr is None:
+                logging.info("Sending terminal message from WatchExpr")
+                expr = "<QUIT>"
+            else:
+                logging.info(f"Sending {expr!r} from WatchExpr")
+
+            return expr
+        except asyncio.TimeoutError:
+            # logging.debug("No expression in the queue, repeating ...")
+            return ""
+
+    @method()
+    def Reply(self, value: "s"):  # noqa:F821
         try:
             value = json.dumps(json.loads(value), indent=2, sort_keys=True)
         except Exception:
             pass
 
-        logging.info(f"Writing {value!r} to stdout")
-        self.write_stdout(value)
+        if self._at_prompt:
+            logging.info(f"Writing {value!r} to stdout then restoring prompt")
+            self.write_stdout("\n" + value)
+            self.write_prompt()
+        else:
+            logging.info(f"Writing {value!r} directly to stdout")
+            self.write_stdout(value)
 
-    @method()
-    def Done(self):
-        self._callback_event.set()
 
-    @method()
-    async def WatchExpr(self) -> "s":  # noqa:F821
-        logging.debug("Received WatchExpr call")
-        try:
-            expr = await asyncio.wait_for(self._expr_queue.get(), 5)
-        except asyncio.TimeoutError:
-            logging.debug("No expression in the queue, repeating ...")
-            return ""
+@asynccontextmanager
+async def stdin_reader() -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+        partial(asyncio.StreamReaderProtocol, reader), sys.stdin
+    )
+    try:
+        yield reader
+    finally:
+        transport.close()
 
-        logging.info(f"Returning {expr!r} from WatchExpr")
 
-        return expr
+async def read_stdin():
+    async with stdin_reader() as reader:
+        while True:
+            line = await reader.readline()
+            try:
+                expr = json.loads(line)
+            except json.JSONDecodeError:
+                expr = line.decode().strip()
+
+            if not line or expr in ("exit;", "quit;"):
+                logging.debug(f"stdin: final line:{line} expr:{expr!r}")
+                break
+
+            logging.debug(f"stdin: yielding line:{line} expr:{expr!r}")
+            yield expr
+
+
+@asynccontextmanager
+async def stdout_writer() -> asyncio.StreamWriter:
+    loop = asyncio.get_event_loop()
+    transport, protocol = await loop.connect_write_pipe(
+        asyncio.streams.FlowControlMixin, sys.stdout
+    )
+    writer = asyncio.StreamWriter(transport, protocol, None, loop)
+
+    try:
+        yield writer
+    finally:
+        transport.close()
 
 
 if __name__ == "__main__":

@@ -16,17 +16,13 @@
            "kwinjs-repl.py"
            (file-name-directory (file-truename (file-name-with-extension
                                                 (file-name-sans-extension load-file-name)
-                                                "el"))))))
-
-(defvar kwinjs--run-mode-new nil)
+                                               "el"))))))
 
 (define-derived-mode kwinjs-mode comint-mode "KWINJS"
   (unless (comint-check-proc (current-buffer))
     (setq-local comint-prompt-regexp "^KWin JS #> ")
     (setq-local comint-use-prompt-regexp t)
     (setq-local comint-prompt-read-only t)
-    (setq-local kwinjs--run-mode-new kwinjs--run-mode-new)
-    (message "gl:%S cur:%S" (default-value 'kwinjs--run-mode-new) kwinjs--run-mode-new)
 
     (setq-local comint-input-sender
                 (lambda (proc string)
@@ -38,17 +34,12 @@
 ;;;###autoload
 (defun kwinjs ()
   (interactive)
-  (let* ((bufname (if kwinjs--run-mode-new "*kwinjs-new*" "*kwinjs*"))
+  (let* ((bufname "*kwinjs*")
          (buf (get-buffer bufname)))
     (unless buf
       (with-current-buffer (setq buf (get-buffer-create bufname))
         (kwinjs-mode)))
     (pop-to-buffer buf)))
-
-(defun kwinjs-new ()
-  (interactive)
-  (let ((kwinjs--run-mode-new t))
-    (kwinjs)))
 
 (defun kwinjs-send ()
   (interactive)
@@ -58,15 +49,17 @@
 
 (defun kwinjs-init-process ()
   (interactive)
-  (message "[kwinjs-init-process] gl:%S cur:%S"
-           (default-value 'kwinjs--run-mode-new) kwinjs--run-mode-new)
-  (apply 'make-comint-in-buffer "kwinjs"
-         (current-buffer)
-         kwinjs--repl
-         (if kwinjs--run-mode-new (list nil "--new"))))
+  (make-comint-in-buffer "kwinjs"
+                         (current-buffer)
+                         kwinjs--repl))
+
+(defun kwinjs-eof ()
+  (interactive)
+  (process-send-eof))
 
 (keymap-set kwinjs-mode-map "RET" 'kwinjs-send)
 (keymap-set kwinjs-mode-map "C-c RET" 'kwinjs-init-process)
 (keymap-set kwinjs-mode-map "C-c C-<return>" 'kwinjs-init-process)
+(keymap-set kwinjs-mode-map "C-d" 'kwinjs-eof)
 
 (provide 'kwinjs)
