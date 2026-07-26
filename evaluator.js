@@ -5,7 +5,7 @@ function log(msg) {
 }
 
 function intro(obj) {
-  const data = {};
+  const attrTypes = {};
 
   [
     ...Object.keys(obj),
@@ -13,13 +13,13 @@ function intro(obj) {
     ...Object.getOwnPropertyNames(Object.getPrototypeOf(obj)),
   ].forEach((k) => {
     try {
-      if (!data[k]) {
-        data[k] = typeof obj[k];
+      if (!attrTypes[k]) {
+        attrTypes[k] = typeof obj[k];
       }
     } catch (e) {}
   });
 
-  return data;
+  return attrTypes;
 }
 
 const globalEval = eval;
@@ -34,24 +34,10 @@ function prompt() {
 function watchExpr() {
   callDBus(DBUS_NAME, "/", DBUS_NAME, "WatchExpr", (expr) => {
     try {
-      log(`expr:${expr} type:${typeof expr}`);
-
       if (expr === "<QUIT>") {
         log("Received terminal message, finishing watchExpr loop");
       } else if (expr) {
-        log(`Evaluating ${JSON.stringify(expr)}`);
-        let res, msg;
-        try {
-          res = globalEval(expr);
-          try {
-            msg = serialize(res);
-            reply(msg);
-          } catch (se) {
-            reply(`stringifying: ${se}`);
-          }
-        } catch (ee) {
-          reply(`evalling: ${ee}`);
-        }
+        reply(evalDBusExpr(expr), prompt);
       } else {
         log("Ignoring empty input, restarting watch call");
         watchExpr();
@@ -62,8 +48,23 @@ function watchExpr() {
   });
 }
 
-function reply(msg) {
-  callDBus(DBUS_NAME, "/", DBUS_NAME, "Reply", msg, prompt);
+function evalDBusExpr(expr) {
+  log(`Evaluating ${JSON.stringify(expr)}`);
+
+  try {
+    let res = globalEval(expr);
+    try {
+      return serialize(res);
+    } catch (se) {
+      return `serialize(): ${se}`;
+    }
+  } catch (ee) {
+    return `eval(): ${ee}`;
+  }
+}
+
+function reply(msg, callback) {
+  callDBus(DBUS_NAME, "/", DBUS_NAME, "Reply", msg, callback);
 }
 
 function serialize(obj) {
