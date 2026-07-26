@@ -12,7 +12,7 @@ import logging
 import signal
 import sys
 from contextlib import asynccontextmanager
-from functools import cached_property, partial
+from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -24,10 +24,9 @@ from dbus_next.service import ServiceInterface, method
 logging.basicConfig(
     filename=Path("~/.cache/kwinjs-repl.log").expanduser(),
     level=logging.DEBUG,
-    format="%(asctime)s %(process)d:%(thread)d %(levelname)7s | %(message)s",
+    format="%(asctime)s [%(process)d] %(levelname)7s | %(message)s",
 )
 
-SCRIPT_TEMPLATE = Path(__file__).parent / "script-template.js"
 EVALUATOR = Path(__file__).parent / "evaluator.js"
 
 
@@ -41,25 +40,24 @@ class KWinJSRepl(ServiceInterface):
 
         self.stdout_queue = asyncio.Queue()
         self.expr_queue = asyncio.Queue()
+        self.stdin_transport: asyncio.ReadTransport | None = None
 
-        self._shutting_down = False
         self._at_prompt = False
-
-    @cached_property
-    def loop(self):
-        return asyncio.get_running_loop()
+        self._shutting_down = False
 
     async def run(self):
         self.register_signals()
         try:
             await self.register_dbus()
             await asyncio.gather(self.stdin_loop(), self.stdout_loop())
+        except asyncio.CancelledError:
+            pass
         finally:
-            await self.shutdown()
+            await self.cleanup()
 
     def register_signals(self):
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            self.loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
+            asyncio.get_running_loop().add_signal_handler(sig, self.stop_stdin)
 
     async def register_dbus(self):
         self.bus = await MessageBus(bus_type=BusType.SESSION).connect()
@@ -70,25 +68,56 @@ class KWinJSRepl(ServiceInterface):
     async def stdin_loop(self):
         script_body = f"const DBUS_NAME = {self.NAME!r};\n" + EVALUATOR.read_text()
         async with self.script_running(script_body):
-            async for expr in read_stdin():
+            async for expr in self.read_stdin():
                 self._at_prompt = False
                 await self.expr_queue.put(expr)
                 logging.info(f"Read {expr!r} stdin -> queue")
 
-            logging.debug("stdin loop finished, stopping queues")
-            await self.stdout_queue.put(None)
-            await self.expr_queue.put(None)
+            self.stdout_queue.shutdown(immediate=True)
+            self.expr_queue.shutdown(immediate=True)
+
+        logging.info("End of stdin loop")
 
     async def stdout_loop(self):
         async with stdout_writer() as writer:
             while True:
-                data = await self.stdout_queue.get()
-                if data is None:
-                    logging.debug("Received None in stdout loop, finishing")
+                try:
+                    data = await self.stdout_queue.get()
+                except asyncio.queues.QueueShutDown as e:
+                    logging.info(f"stdout_queue shutdown: {e}")
                     break
 
                 writer.write(data.encode("utf-8", errors="replace"))
                 await writer.drain()
+
+        logging.info("End of stdout loop")
+
+    async def read_stdin(self):
+        async with self.stdin_reader() as reader:
+            while True:
+                line = await reader.readline()
+                try:
+                    expr = json.loads(line)
+                except json.JSONDecodeError:
+                    expr = line.decode().strip()
+
+                if not line or expr in ("exit;", "quit;"):
+                    logging.debug(f"stdin: final line:{line} expr:{expr!r}")
+                    break
+
+                logging.debug(f"stdin: yielding line:{line} expr:{expr!r}")
+                yield expr
+
+    @asynccontextmanager
+    async def stdin_reader(self) -> asyncio.StreamReader:
+        reader = asyncio.StreamReader()
+        self.stdin_transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+            partial(asyncio.StreamReaderProtocol, reader), sys.stdin
+        )
+        try:
+            yield reader
+        finally:
+            self.stdin_transport.close()
 
     @asynccontextmanager
     async def script_running(self, body: str):
@@ -137,23 +166,24 @@ class KWinJSRepl(ServiceInterface):
 
         raise RuntimeError(f"DBus interface for script {script_id} not found")
 
-    async def shutdown(self, sig=None):
-        if self._shutting_down:
-            return
-        self._shutting_down = True
+    def stop_stdin(self, sig=None):
+        logging.info(f"Stopping REPL stdin (signal: {sig})")
 
-        if sig:
-            logging.info(f"Caught sig={sig}, shutting down")
-        else:
-            logging.info("Shutting down")
+        if self.stdin_transport:
+            self.stdin_transport.close()
+
+    async def cleanup(self):
+        logging.info("Cleanup")
 
         if self.bus:
             try:
+                logging.debug("Releasing DBus name")
                 await self.bus.release_name(self.NAME)
             except Exception as e:
                 logging.warning(f"{type(e).__name__}({e}) when releasing D-Bus name {self.NAME}")
 
             try:
+                logging.debug("Disconnecting from DBus")
                 self.bus.disconnect()
             except Exception as e:
                 logging.warning(f"{type(e).__name__}({e}) when disconnecting from D-Bus")
@@ -164,8 +194,6 @@ class KWinJSRepl(ServiceInterface):
 
     @method()
     async def WatchExpr(self) -> "s":  # noqa:F821
-        # logging.debug("Received WatchExpr call")
-
         try:
             expr = await asyncio.wait_for(self.expr_queue.get(), 15)
             if expr is None:
@@ -176,8 +204,10 @@ class KWinJSRepl(ServiceInterface):
 
             return expr
         except asyncio.TimeoutError:
-            # logging.debug("No expression in the queue, repeating ...")
             return ""
+        except asyncio.queues.QueueShutDown as e:
+            logging.info(f"expr_queue shutdown: {e}")
+            return "<QUIT>"
 
     @method()
     def Reply(self, value: "s"):  # noqa:F821
@@ -187,41 +217,10 @@ class KWinJSRepl(ServiceInterface):
             pass
 
         if self._at_prompt:
-            logging.info(f"Writing {value!r} to stdout then restoring prompt")
             self.write_stdout("\n" + value)
             self.write_prompt()
         else:
-            logging.info(f"Writing {value!r} directly to stdout")
             self.write_stdout(value)
-
-
-@asynccontextmanager
-async def stdin_reader() -> asyncio.StreamReader:
-    reader = asyncio.StreamReader()
-    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
-        partial(asyncio.StreamReaderProtocol, reader), sys.stdin
-    )
-    try:
-        yield reader
-    finally:
-        transport.close()
-
-
-async def read_stdin():
-    async with stdin_reader() as reader:
-        while True:
-            line = await reader.readline()
-            try:
-                expr = json.loads(line)
-            except json.JSONDecodeError:
-                expr = line.decode().strip()
-
-            if not line or expr in ("exit;", "quit;"):
-                logging.debug(f"stdin: final line:{line} expr:{expr!r}")
-                break
-
-            logging.debug(f"stdin: yielding line:{line} expr:{expr!r}")
-            yield expr
 
 
 @asynccontextmanager
