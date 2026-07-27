@@ -22,6 +22,39 @@ function intro(obj) {
   return attrTypes;
 }
 
+if (!Object.fromEntries) {
+  Object.defineProperty(Object, "fromEntries", {
+    value(entries) {
+      const obj = {};
+      entries.forEach(([k, v]) => {
+        obj[k] = v;
+      });
+      return obj;
+    },
+    writable: true,
+    configurable: true,
+  });
+}
+
+Object.defineProperties(Object, {
+  filter: {
+    value(obj, pred) {
+      return Object.fromEntries(
+        Object.entries(obj).filter(([k, v]) => pred(k, v)),
+      );
+    },
+    writable: true,
+    configurable: true,
+  },
+  merge: {
+    value(...objs) {
+      return Object.assign({}, ...objs);
+    },
+    writable: true,
+    configurable: true,
+  },
+});
+
 const globalEval = eval;
 
 function prompt() {
