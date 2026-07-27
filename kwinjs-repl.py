@@ -50,8 +50,6 @@ class KWinJSRepl(ServiceInterface):
         try:
             await self.register_dbus()
             await asyncio.gather(self.stdin_loop(), self.stdout_loop())
-        except asyncio.CancelledError:
-            pass
         finally:
             await self.cleanup()
 
@@ -83,8 +81,8 @@ class KWinJSRepl(ServiceInterface):
             while True:
                 try:
                     data = await self.stdout_queue.get()
-                except asyncio.queues.QueueShutDown as e:
-                    logging.info(f"stdout_queue shutdown: {e}")
+                except asyncio.queues.QueueShutDown:
+                    logging.info("stdout_queue shutdown")
                     break
 
                 writer.write(data.encode("utf-8", errors="replace"))
@@ -105,7 +103,7 @@ class KWinJSRepl(ServiceInterface):
                     logging.debug(f"stdin: final line:{line} expr:{expr!r}")
                     break
 
-                logging.debug(f"stdin: yielding line:{line} expr:{expr!r}")
+                logging.debug(f"stdin: received line:{line} expr:{expr!r}, propagating")
                 yield expr
 
     @asynccontextmanager
@@ -205,8 +203,8 @@ class KWinJSRepl(ServiceInterface):
             return expr
         except asyncio.TimeoutError:
             return ""
-        except asyncio.queues.QueueShutDown as e:
-            logging.info(f"expr_queue shutdown: {e}")
+        except asyncio.queues.QueueShutDown:
+            logging.info("expr_queue shutdown")
             return "<QUIT>"
 
     @method()
