@@ -41,7 +41,7 @@
         (kwinjs-mode)))
     (pop-to-buffer buf)))
 
-(defun kwinjs-send ()
+(defun kwinjs-newline-or-send ()
   (interactive)
   (if (eq (char-before (point)) ?\;)
       (comint-send-input)
@@ -57,7 +57,8 @@
   (interactive)
   (process-send-eof))
 
-(keymap-set kwinjs-mode-map "RET" 'kwinjs-send)
+(keymap-set kwinjs-mode-map "RET" 'kwinjs-newline-or-send)
+(keymap-set kwinjs-mode-map "C-<return>" 'comint-send-input)
 (keymap-set kwinjs-mode-map "C-c RET" 'kwinjs-init-process)
 (keymap-set kwinjs-mode-map "C-c C-<return>" 'kwinjs-init-process)
 (keymap-set kwinjs-mode-map "C-d" 'kwinjs-eof)

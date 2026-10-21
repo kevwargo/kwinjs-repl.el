@@ -107,8 +107,57 @@ function serialize(obj) {
     case "null":
       return `${obj}`;
     default:
-      return JSON.stringify(obj);
+      return JSON.stringify(uncycle(obj));
   }
+}
+
+class ObjectRefs {
+  constructor() {
+    this.wm = new WeakMap();
+    this.counter = 0;
+  }
+
+  ref(v) {
+    if (typeof v !== "object") return `${v}`;
+
+    if (!this.wm.has(v)) {
+      this.wm.set(v, ++this.counter);
+    }
+
+    const type = v instanceof Array ? "arr" : "obj";
+
+    return `${type}#${this.wm.get(v)}(${v})`;
+  }
+}
+
+R = new ObjectRefs();
+
+function id(v) {
+  return R.ref(v);
+}
+
+function uncycle(obj, visited) {
+  if (typeof obj !== "object" || obj === null) return obj;
+  const isArray = obj instanceof Array;
+
+  if (isArray) {
+    return obj.map((v) => uncycle(v, visited));
+  }
+
+  for (const v of visited ?? []) {
+    if (v.orig === obj) {
+      v.copy["#id"] = id(obj);
+      return id(obj);
+    }
+  }
+
+  const copy = {};
+
+  Object.keys(obj).forEach((k) => {
+    copy[k] = uncycle(obj[k], [{ orig: obj, copy }, ...(visited ?? [])]);
+  });
+
+  return copy;
 }
 
 log("Requesting initial prompt");

@@ -210,7 +210,7 @@ class KWinJSRepl(ServiceInterface):
     @method()
     def Reply(self, value: "s"):  # noqa:F821
         try:
-            value = json.dumps(json.loads(value), indent=2, sort_keys=True)
+            value = json.dumps(json.loads(value), indent=2, sort_keys=True, ensure_ascii=False)
         except Exception:
             pass
 
