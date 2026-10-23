@@ -1,7 +1,10 @@
 // const DBUS_NAME = ...
 
-function log(msg) {
-  print(`[EVALUATOR] ${msg}`);
+function log(msg, level) {
+  const logFn =
+    (level === "warning" ? console.warn : console[level]) ?? console.info;
+  const ms = new Date().toISOString().substring(19, 23);
+  logFn(`[EVALUATOR ${ms}] ${msg}`);
 }
 
 function intro(obj) {
@@ -20,6 +23,62 @@ function intro(obj) {
   });
 
   return attrTypes;
+}
+
+function runAfter(delay, callback) {
+  return startTimer(delay, callback, true);
+}
+
+function runEvery(delay, callback) {
+  return startTimer(delay, callback, false);
+}
+
+function reply(msg, callback) {
+  try {
+    msg = serialize(msg);
+  } catch (err) {
+    msg = `serialize(): ${err}`;
+  }
+
+  callDBus(DBUS_NAME, "/", DBUS_NAME, "Reply", msg, callback);
+}
+
+function serialize(obj) {
+  switch (typeof obj) {
+    case "function":
+    case "undefined":
+      return `${obj}`;
+    default:
+      return JSON.stringify(uncycle(obj));
+  }
+}
+
+function id(v) {
+  return refs.get(v);
+}
+
+function uncycle(obj, visited) {
+  if (typeof obj !== "object" || obj === null) return obj;
+  const isArray = obj instanceof Array;
+
+  if (isArray) {
+    return obj.map((v) => uncycle(v, visited));
+  }
+
+  for (const v of visited ?? []) {
+    if (v.orig === obj) {
+      v.copy["#id"] = id(obj);
+      return id(obj);
+    }
+  }
+
+  const copy = {};
+
+  Object.keys(obj).forEach((k) => {
+    copy[k] = uncycle(obj[k], [{ orig: obj, copy }, ...(visited ?? [])]);
+  });
+
+  return copy;
 }
 
 if (!Object.fromEntries) {
@@ -57,68 +116,46 @@ Object.defineProperties(Object, {
 
 const globalEval = eval;
 
-function prompt() {
-  callDBus(DBUS_NAME, "/", DBUS_NAME, "Prompt", () => {
-    log("Calling watchExpr after prompt");
-    watchExpr();
-  });
-}
-
-function watchExpr() {
-  callDBus(DBUS_NAME, "/", DBUS_NAME, "WatchExpr", (expr) => {
-    try {
-      if (expr === "<QUIT>") {
-        log("Received terminal message, finishing watchExpr loop");
-      } else if (expr) {
-        reply(evalDBusExpr(expr), prompt);
-      } else {
-        log("Ignoring empty input, restarting watch call");
-        watchExpr();
+const dbusWatcher = {
+  prompt() {
+    callDBus(DBUS_NAME, "/", DBUS_NAME, "Prompt", () => {
+      log("Calling dbusWatcher.watch after prompt");
+      this.watch();
+    });
+  },
+  watch() {
+    callDBus(DBUS_NAME, "/", DBUS_NAME, "WatchExpr", (expr) => {
+      try {
+        if (expr === "<QUIT>") {
+          log("Received terminal message, finishing dbusWatcher loop");
+        } else if (expr) {
+          reply(this.evalExpr(expr), () => this.prompt());
+        } else {
+          log("Ignoring empty input, restarting watch call", "debug");
+          this.watch();
+        }
+      } catch (e) {
+        log(`${e}`, "error");
       }
-    } catch (e) {
-      log(`ERROR: ${e}`);
-    }
-  });
-}
+    });
+  },
+  evalExpr(expr) {
+    log(`Evaluating ${JSON.stringify(expr)}`, "debug");
 
-function evalDBusExpr(expr) {
-  log(`Evaluating ${JSON.stringify(expr)}`);
-
-  try {
-    let res = globalEval(expr);
     try {
-      return serialize(res);
-    } catch (se) {
-      return `serialize(): ${se}`;
+      return globalEval(expr);
+    } catch (ee) {
+      return `eval(): ${ee}`;
     }
-  } catch (ee) {
-    return `eval(): ${ee}`;
-  }
-}
+  },
+};
 
-function reply(msg, callback) {
-  callDBus(DBUS_NAME, "/", DBUS_NAME, "Reply", msg, callback);
-}
+const refs = {
+  wm: new WeakMap(),
+  counter: 0,
 
-function serialize(obj) {
-  switch (typeof obj) {
-    case "function":
-    case "undefined":
-    case "null":
-      return `${obj}`;
-    default:
-      return JSON.stringify(uncycle(obj));
-  }
-}
-
-class ObjectRefs {
-  constructor() {
-    this.wm = new WeakMap();
-    this.counter = 0;
-  }
-
-  ref(v) {
-    if (typeof v !== "object") return `${v}`;
+  get(v) {
+    if (typeof v !== "object" || v === null) return `${v}`;
 
     if (!this.wm.has(v)) {
       this.wm.set(v, ++this.counter);
@@ -127,38 +164,24 @@ class ObjectRefs {
     const type = v instanceof Array ? "arr" : "obj";
 
     return `${type}#${this.wm.get(v)}(${v})`;
-  }
-}
+  },
+};
 
-R = new ObjectRefs();
+const startTimer = (delay, callback, singleShot) => {
+  const t = new QTimer();
 
-function id(v) {
-  return R.ref(v);
-}
+  t.interval = delay;
+  t.singleShot = singleShot;
+  t.timerType = 0;
+  t.timeout.connect(callback);
+  t.start();
 
-function uncycle(obj, visited) {
-  if (typeof obj !== "object" || obj === null) return obj;
-  const isArray = obj instanceof Array;
-
-  if (isArray) {
-    return obj.map((v) => uncycle(v, visited));
-  }
-
-  for (const v of visited ?? []) {
-    if (v.orig === obj) {
-      v.copy["#id"] = id(obj);
-      return id(obj);
-    }
-  }
-
-  const copy = {};
-
-  Object.keys(obj).forEach((k) => {
-    copy[k] = uncycle(obj[k], [{ orig: obj, copy }, ...(visited ?? [])]);
-  });
-
-  return copy;
-}
+  return {
+    cancel() {
+      t.stop();
+    },
+  };
+};
 
 log("Requesting initial prompt");
-prompt();
+dbusWatcher.prompt();
