@@ -1,5 +1,10 @@
 // const DBUS_NAME = ...
 
+function wlist(all) {
+  const ws = workspace.windowList();
+  return all ? ws : ws.filter((w) => w.normalWindow);
+}
+
 function log(msg, level) {
   const logFn =
     (level === "warning" ? console.warn : console[level]) ?? console.info;
